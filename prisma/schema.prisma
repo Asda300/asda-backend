@@ -1,0 +1,53 @@
+// Wannan shine injin da zai sarrafa mana database
+generator client {
+  provider = "prisma-client-js"
+}
+
+// MUN GYARA NAN: Mun canza daga sqlite zuwa postgresql domin yayi daidai da Railway
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -------------------------------------------------
+// TEBURAN BAYANANMU (MODELS)
+// -------------------------------------------------
+
+// 1. Teburin Masu Amfani da App din (Users)
+model User {
+  id        Int      @id @default(autoincrement())
+  fullName  String
+  email     String   @unique
+  password  String
+  phone     String?
+  role      String   @default("USER") // Zai iya zama 'USER' ko 'ADMIN'
+  createdAt DateTime @default(now())
+
+  // Dangantakar User da sauran abubuwa
+  wallet       Wallet?
+  transactions Transaction[]
+}
+
+// 2. Teburin Asusun Kudi (Wallets)
+model Wallet {
+  id      Int   @id @default(autoincrement())
+  balance Float @default(0.0) // Kowa zai fara da Naira 0.0
+
+  // Wane User ne mai wannan wallet din?
+  userId  Int   @unique
+  user    User  @relation(fields: [userId], references: [id])
+}
+
+// 3. Teburin Tarihin Saye-da-sayarwa (Transactions)
+model Transaction {
+  id          Int      @id @default(autoincrement())
+  type        String   // Misali: 'AIRTIME', 'DATA', 'FUND_WALLET'
+  amount      Float
+  status      String   @default("PENDING") // 'SUCCESS', 'FAILED', 'PENDING'
+  reference   String   @unique // Number shaida ta musamman (Receipt No.)
+  createdAt   DateTime @default(now())
+
+  // Wane User ne yayi wannan transaction din?
+  userId      Int
+  user        User     @relation(fields: [userId], references: [id])
+}
