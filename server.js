@@ -12,20 +12,74 @@ const prisma = new PrismaClient();
 app.use(cors());
 app.use(express.json());
 
+// --- MONNIFY CONFIGURATION (Daga Environment Variables) ---
+const MONNIFY_BASE_URL = process.env.MONNIFY_BASE_URL || "https://sandbox.monnify.com";
+const MONNIFY_API_KEY = process.env.MONNIFY_API_KEY;
+const MONNIFY_SECRET_KEY = process.env.MONNIFY_SECRET_KEY;
+const MONNIFY_CONTRACT_CODE = process.env.MONNIFY_CONTRACT_CODE;
+
 // ==========================================
-// 1. BABBAN SHAFIN API (HOME ROUTE)
+// 1. HOME ROUTE
 // ==========================================
-// Wannan zai gyara "Cannot GET /"
 app.get('/', (req, res) => {
     res.json({
-        message: "ASDA Digital Hub API is Live! 🚀",
+        message: "ASDA Digital Hub API is Live with Monnify! 🚀",
         status: "Running",
         author: "ASDA Team"
     });
 });
 
 // ==========================================
-// TSARON ASIRI (AUTHENTICATION MIDDLEWARE)
+// 2. MONNIFY HELPER FUNCTIONS
+// ==========================================
+
+// A. Samo Token daga Monnify
+const getMonnifyToken = async () => {
+    try {
+        const auth = Buffer.from(`${MONNIFY_API_KEY}:${MONNIFY_SECRET_KEY}`).toString('base64');
+        const response = await fetch(`${MONNIFY_BASE_URL}/api/v1/auth/login`, {
+            method: 'POST',
+            headers: { 'Authorization': `Basic ${auth}` }
+        });
+        const data = await response.json();
+        if (!data.requestSuccessful) throw new Error("Monnify Authentication Failed");
+        return data.responseBody.accessToken;
+    } catch (error) {
+        console.error("Monnify Token Error:", error);
+        throw error;
+    }
+};
+
+// B. Samar da Virtual Account
+const generateVirtualAccount = async (user, token) => {
+    try {
+        const response = await fetch(`${MONNIFY_BASE_URL}/api/v1/bank-transfer/reserved-accounts`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                accountReference: `ASDA-${Date.now()}-${user.email.split('@')[0]}`,
+                accountName: user.fullName,
+                currencyCode: "NGN",
+                contractCode: MONNIFY_CONTRACT_CODE,
+                customerEmail: user.email,
+                customerName: user.fullName,
+                getAllAvailableBanks: true
+            })
+        });
+        const data = await response.json();
+        if (!data.requestSuccessful) throw new Error(data.responseMessage || "Failed to generate account");
+        return data.responseBody.accounts[0]; // Muna daukar banki na farko
+    } catch (error) {
+        console.error("Monnify Account Error:", error);
+        throw error;
+    }
+};
+
+// ==========================================
+// 3. TSARON ASIRI (AUTHENTICATION MIDDLEWARE)
 // ==========================================
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
@@ -41,29 +95,44 @@ const authenticateToken = (req, res, next) => {
 };
 
 // ==========================================
-// USER AUTHENTICATION ROUTES
+// 4. USER AUTHENTICATION ROUTES
 // ==========================================
 
-// REGISTER
+// REGISTER (Tare da Monnify Integration)
 app.post('/api/register', async (req, res) => {
     try {
         const { fullName, email, password, phone } = req.body;
+        
         const existingUser = await prisma.user.findUnique({ where: { email } });
         if (existingUser) return res.status(400).json({ error: "Email already in use!" });
 
+        // 1. Boye Password
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
 
+        // 2. Samo Virtual Account daga Monnify
+        const token = await getMonnifyToken();
+        const vAccount = await generateVirtualAccount({ fullName, email }, token);
+
+        // 3. Adana User da Wallet dinsa
         const newUser = await prisma.user.create({
             data: {
                 fullName, email, password: hashedPassword, phone,
-                wallet: { create: { balance: 0.0 } }
+                wallet: { 
+                    create: { 
+                        balance: 0.0,
+                        bankName: vAccount.bankName,
+                        accountNumber: vAccount.accountNumber,
+                        accountName: vAccount.accountName
+                    } 
+                }
             }
         });
+        
         res.status(201).json({ message: "Registration successful!", user: newUser });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: "Registration failed." });
+        console.error("Registration Error:", error);
+        res.status(500).json({ error: error.message || "Registration failed." });
     }
 });
 
@@ -88,16 +157,22 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// GET USER DATA
+// GET USER DATA (Don Dashboard)
 app.get('/api/user/me', authenticateToken, async (req, res) => {
     try {
         const user = await prisma.user.findUnique({
             where: { id: req.user.id },
             include: { wallet: true, transactions: { orderBy: { createdAt: 'desc' }, take: 15 } }
         });
+        
         res.json({
-            fullName: user.fullName, email: user.email, phone: user.phone,
+            fullName: user.fullName, 
+            email: user.email, 
+            phone: user.phone,
             balance: user.wallet ? user.wallet.balance : 0.0,
+            bankName: user.wallet?.bankName || "Not Assigned",
+            accountNumber: user.wallet?.accountNumber || "Not Assigned",
+            accountName: user.wallet?.accountName || "Not Assigned",
             transactions: user.transactions
         });
     } catch (error) {
@@ -105,58 +180,11 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
     }
 });
 
-// FUND WALLET
-app.post('/api/fund-wallet', authenticateToken, async (req, res) => {
-    try {
-        const { amount } = req.body;
-        const fundAmount = parseFloat(amount);
-        if (!fundAmount || fundAmount <= 0) return res.status(400).json({ error: "Invalid amount." });
-
-        const updatedWallet = await prisma.wallet.update({
-            where: { userId: req.user.id },
-            data: { balance: { increment: fundAmount } }
-        });
-
-        const newTransaction = await prisma.transaction.create({
-            data: { userId: req.user.id, type: 'FUND_WALLET', amount: fundAmount, status: 'SUCCESS', reference: 'FND-' + Date.now() }
-        });
-        res.json({ message: "Wallet funded successfully!", newBalance: updatedWallet.balance, transaction: newTransaction });
-    } catch (error) {
-        res.status(500).json({ error: "Failed to fund wallet." });
-    }
-});
-
 // ==========================================
-// ADMIN DASHBOARD ROUTE
+// 5. VTU & WALLET LOGIC
 // ==========================================
-app.get('/api/admin/dashboard', authenticateToken, async (req, res) => {
-    try {
-        const totalUsers = await prisma.user.count();
-        const walletAgg = await prisma.wallet.aggregate({ _sum: { balance: true } });
-        const totalWalletBalance = walletAgg._sum.balance || 0;
 
-        const txAgg = await prisma.transaction.aggregate({ 
-            _sum: { amount: true },
-            where: { type: { not: 'FUND_WALLET' } }
-        });
-        const totalSales = txAgg._sum.amount || 0;
-
-        const recentTransactions = await prisma.transaction.findMany({
-            orderBy: { createdAt: 'desc' },
-            take: 20,
-            include: { user: { select: { fullName: true, email: true } } }
-        });
-
-        res.json({ totalUsers, totalWalletBalance, totalSales, recentTransactions });
-    } catch (error) {
-        res.status(500).json({ error: "Failed to fetch admin data." });
-    }
-});
-
-// ==========================================
-// REAL API INTEGRATION LAYER (Simulation)
-// ==========================================
-const processPayment = async (userId, cost, description, referencePrefix, serviceDetails) => {
+const processPayment = async (userId, cost, description, referencePrefix) => {
     const userWallet = await prisma.wallet.findUnique({ where: { userId } });
     if (!userWallet || userWallet.balance < cost) throw new Error("Insufficient Wallet Balance.");
 
@@ -175,22 +203,11 @@ const processPayment = async (userId, cost, description, referencePrefix, servic
     return { updatedWallet, transaction };
 };
 
-// CORE VTU ROUTES
 app.post('/api/buy-airtime', authenticateToken, async (req, res) => {
     try {
         const { network, phone, amount } = req.body;
-        const result = await processPayment(req.user.id, amount, `${network} AIRTIME - ${phone}`, 'AIR', { type: 'airtime', network, phone, amount });
+        const result = await processPayment(req.user.id, amount, `${network} AIRTIME - ${phone}`, 'AIR');
         res.json({ message: `Successfully purchased ₦${amount} ${network} airtime`, newBalance: result.updatedWallet.balance });
-    } catch (error) {
-        res.status(400).json({ error: error.message });
-    }
-});
-
-app.post('/api/buy-data', authenticateToken, async (req, res) => {
-    try {
-        const { network, phone, plan, amount } = req.body;
-        const result = await processPayment(req.user.id, amount, `${network} DATA (${plan}) - ${phone}`, 'DAT', { type: 'data', network, phone, plan });
-        res.json({ message: `Successfully purchased ${plan} ${network} data`, newBalance: result.updatedWallet.balance });
     } catch (error) {
         res.status(400).json({ error: error.message });
     }
